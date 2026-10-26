@@ -434,8 +434,9 @@ def synthesize_script(script: str, work_dir: Path) -> tuple[Path, Path, Path, fl
             text = " ".join(word["text"] for word in group).strip()
             srt.write(f"{number}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{text}\n\n")
 
-    # ASS subtitle styling: bold white text, black outline, amber/orange backing box,
-    # positioned in the right-center so the book cover remains unobstructed.
+    # Karaoke caption style matching the supplied reference: bold white words with
+    # black outline; the currently spoken word gets an orange rectangular highlight.
+    # WordBoundary events from Edge TTS drive the highlight timing when available.
     header = r"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1920
@@ -445,7 +446,8 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,Arial Black,68,&H00FFFFFF,&H0000A5FF,&H00000000,&H0000A5FF,-1,0,3,2,1,6,830,105,0,1
+Style: Caption,Arial,72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,1,4,1,5,0,0,0,1
+Style: Active,Arial,72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H0000A5FF,-1,0,3,1,0,5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -453,11 +455,34 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with ass_path.open("w", encoding="utf-8") as ass:
         ass.write(header)
         for group in groups:
-            start = group[0]["start"]
-            end = max(group[-1]["end"], start + 0.35)
-            text = " ".join(w["text"] for w in group)
-            text = text.replace("{", r"\{").replace("}", r"\}")
-            ass.write(f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},Caption,,0,0,0,,{text}\n")
+            group_start = group[0]["start"]
+            group_end = max(group[-1]["end"], group_start + 0.45)
+            # Keep each 3-4 word phrase on one centered line in the right half.
+            # Arial's average bold glyph width is approximated for stable word spacing.
+            widths = [max(28, len(w["text"]) * 39) for w in group]
+            gap = 22
+            total_width = sum(widths) + gap * (len(group) - 1)
+            x = 1370 - total_width / 2
+            positions = []
+            for width in widths:
+                positions.append(int(x + width / 2))
+                x += width + gap
+            for idx, word in enumerate(group):
+                text = str(word["text"]).replace("{", r"\{").replace("}", r"\}")
+                pos = positions[idx]
+                # Base word remains visible for the whole phrase.
+                ass.write(
+                    f"Dialogue: 0,{ass_timestamp(group_start)},{ass_timestamp(group_end)},Caption,,0,0,0,,"
+                    f"{{\\an5\\pos({pos},540)}}{text}\n"
+                )
+                # Overlay the orange box only while this word is being spoken.
+                active_start = max(group_start, float(word["start"]))
+                active_end = min(group_end, max(float(word["end"]), active_start + 0.08))
+                if active_end > active_start:
+                    ass.write(
+                        f"Dialogue: 1,{ass_timestamp(active_start)},{ass_timestamp(active_end)},Active,,0,0,0,,"
+                        f"{{\\an5\\pos({pos},540)}}{text}\n"
+                    )
 
     actual_duration = probe_duration(voice_path)
     minutes = actual_duration / 60
@@ -529,7 +554,7 @@ def assemble_video(topic: str, cover: Path, voice: Path, ass: Path, duration: fl
         ),
         "-filter_complex",
         (
-            f"[2:a]volume=0.12[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
+            f"[2:a]volume=0.30[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
             f"dropout_transition=3:normalize=0[aout]"
         ),
         "-map", "0:v:0", "-map", "[aout]",
@@ -551,7 +576,7 @@ def assemble_video(topic: str, cover: Path, voice: Path, ass: Path, duration: fl
             f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
             f"crop={WIDTH}:{HEIGHT},fps={FPS},setsar=1,"
             f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.10:t=fill[bg];"
-            f"[2:a]volume=0.12[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
+            f"[2:a]volume=0.30[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
             f"dropout_transition=3:normalize=0[aout]"
         ),
         "-vf",
@@ -581,7 +606,7 @@ def assemble_video(topic: str, cover: Path, voice: Path, ass: Path, duration: fl
             f"crop={WIDTH}:{HEIGHT},fps={FPS},setsar=1,"
             f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.10:t=fill[bg];"
             f"[bg]subtitles='{ass_path}'[sub];"
-            f"[2:a]volume=0.12[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
+            f"[2:a]volume=0.30[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
             f"dropout_transition=3:normalize=0[aout]"
         ),
         "-map", "[sub]", "-map", "[aout]",
@@ -609,7 +634,7 @@ def assemble_video(topic: str, cover: Path, voice: Path, ass: Path, duration: fl
             f"pad={cover_w}:{cover_h}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgba[book];"
             f"[bg][book]overlay={cover_x}:{cover_y}:shortest=1[withbook];"
             f"[withbook]subtitles='{ass_path}'[vout];"
-            f"[2:a]volume=0.12[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
+            f"[2:a]volume=0.30[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
             f"dropout_transition=3:normalize=0[aout]"
         ),
         "-map", "[vout]", "-map", "[aout]",
