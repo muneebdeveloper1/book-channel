@@ -369,19 +369,42 @@ def synthesize_script(script: str, work_dir: Path) -> tuple[Path, Path, Path, fl
     chunk_files: list[Path] = []
     all_words: list[dict[str, Any]] = []
     offset_seconds = 0.0
+    chunk_timing_fallbacks: list[tuple[str, float, float]] = []
     for index, chunk in enumerate(chunks, 1):
         audio_path = work_dir / f"voice_{index:03d}.mp3"
         log(f"Synthesizing audio chunk {index}/{len(chunks)} ({len(chunk)} chars)")
         boundaries = asyncio.run(synthesize_chunk(chunk, audio_path))
         duration = probe_duration(audio_path)
-        for boundary in boundaries:
-            all_words.append({
-                "text": boundary["text"],
-                "start": offset_seconds + boundary["offset"],
-                "end": offset_seconds + boundary["offset"] + max(boundary["duration"], 0.08),
-            })
+        if boundaries:
+            for boundary in boundaries:
+                word = str(boundary.get("text", "")).strip()
+                if word:
+                    all_words.append({
+                        "text": word,
+                        "start": offset_seconds + float(boundary["offset"]),
+                        "end": offset_seconds + float(boundary["offset"]) + max(float(boundary["duration"]), 0.08),
+                    })
+        else:
+            # Some Edge TTS responses provide audio but no WordBoundary events.
+            # Save the chunk and create approximate synchronized captions later.
+            chunk_timing_fallbacks.append((chunk, offset_seconds, duration))
         offset_seconds += duration
         chunk_files.append(audio_path)
+
+    if not all_words and chunk_timing_fallbacks:
+        log("Edge TTS supplied no word timings; creating approximate timed captions from narration text.")
+        for chunk, chunk_start, chunk_duration in chunk_timing_fallbacks:
+            words = chunk.split()
+            if not words:
+                continue
+            # Allocate timing by word count so captions cover the spoken chunk.
+            step = chunk_duration / len(words)
+            for idx, word in enumerate(words):
+                all_words.append({
+                    "text": word,
+                    "start": chunk_start + idx * step,
+                    "end": chunk_start + (idx + 1) * step,
+                })
 
     concat_file = work_dir / "audio_concat.txt"
     concat_file.write_text(
@@ -506,7 +529,7 @@ def assemble_video(topic: str, cover: Path, voice: Path, ass: Path, duration: fl
         ),
         "-filter_complex",
         (
-            f"[2:a]volume=0.08[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
+            f"[2:a]volume=0.12[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
             f"dropout_transition=3:normalize=0[aout]"
         ),
         "-map", "0:v:0", "-map", "[aout]",
@@ -528,7 +551,7 @@ def assemble_video(topic: str, cover: Path, voice: Path, ass: Path, duration: fl
             f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
             f"crop={WIDTH}:{HEIGHT},fps={FPS},setsar=1,"
             f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.10:t=fill[bg];"
-            f"[2:a]volume=0.08[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
+            f"[2:a]volume=0.12[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
             f"dropout_transition=3:normalize=0[aout]"
         ),
         "-vf",
@@ -558,7 +581,7 @@ def assemble_video(topic: str, cover: Path, voice: Path, ass: Path, duration: fl
             f"crop={WIDTH}:{HEIGHT},fps={FPS},setsar=1,"
             f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.10:t=fill[bg];"
             f"[bg]subtitles='{ass_path}'[sub];"
-            f"[2:a]volume=0.08[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
+            f"[2:a]volume=0.12[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
             f"dropout_transition=3:normalize=0[aout]"
         ),
         "-map", "[sub]", "-map", "[aout]",
@@ -586,7 +609,7 @@ def assemble_video(topic: str, cover: Path, voice: Path, ass: Path, duration: fl
             f"pad={cover_w}:{cover_h}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgba[book];"
             f"[bg][book]overlay={cover_x}:{cover_y}:shortest=1[withbook];"
             f"[withbook]subtitles='{ass_path}'[vout];"
-            f"[2:a]volume=0.08[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
+            f"[2:a]volume=0.12[bgm];[1:a][bgm]amix=inputs=2:duration=first:"
             f"dropout_transition=3:normalize=0[aout]"
         ),
         "-map", "[vout]", "-map", "[aout]",
