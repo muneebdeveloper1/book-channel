@@ -52,19 +52,24 @@ OUTPUT_DIR = ROOT / "output"
 WORK_DIR = ROOT / "work"
 
 VOICE = os.getenv("NARRATION_VOICE", "en-US-ChristopherNeural")
+CURRENT_TTS_RATE = os.getenv("NARRATION_RATE", "+0%")
+# Production is aimed at 45 minutes; test mode is aimed at 2.5 minutes.
 TARGET_MINUTES = int(os.getenv("TARGET_MINUTES", "45"))
-MINUTES_MIN = 40
-MINUTES_MAX = 50
+PRODUCTION_MINUTES_MIN = 40
+PRODUCTION_MINUTES_MAX = 50
+TEST_MINUTES_MIN = 2
+TEST_MINUTES_MAX = 3
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "6000k")
 FPS = 30
 WIDTH, HEIGHT = 1920, 1080
 
+# Keep the requested fallback order. These are text-generation model IDs,
+# not Gemini TTS model IDs.
 DEFAULT_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
 ]
 MODEL_ORDER = [m.strip() for m in os.getenv("GEMINI_MODELS", ",".join(DEFAULT_MODELS)).split(",") if m.strip()]
 
@@ -158,49 +163,108 @@ def generate_script(topic: str) -> str:
     api_key = require_env("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
     test_mode = os.getenv("FACTORY_TEST_MODE", "false").lower() == "true"
-    # Multiple manageable sections are more reliable than one giant response.
-    section_names = [
-        "The uncomfortable truth", "The hidden cost of staying the same",
-        "Rebuilding your identity", "Discipline when motivation disappears",
-        "Becoming valuable through action", "Turning setbacks into leverage",
-        "The daily system that compounds", "A powerful closing challenge",
-    ]
+
     if test_mode:
-        section_names = ["Short test narration", "Short closing"]
+        # About 330-400 words normally produces 2-3 minutes of speech.
+        section_names = ["The core idea", "A practical action and closing"]
+        section_target = "165-200 spoken English words"
+        min_words, max_words = 320, 420
+        duration_target = "2-3 minutes when read aloud"
+    else:
+        # 8 sections targeting roughly 760-810 words each. We check the
+        # combined word count below and add a section if the model under-delivers.
+        section_names = [
+            "The uncomfortable truth",
+            "The hidden cost of staying the same",
+            "Rebuilding your identity",
+            "Discipline when motivation disappears",
+            "Becoming valuable through action",
+            "Turning setbacks into leverage",
+            "The daily system that compounds",
+            "A powerful closing challenge",
+        ]
+        section_target = "760-810 spoken English words"
+        min_words, max_words = 5800, 6500
+        duration_target = "40-50 minutes when read aloud, ideally about 45 minutes"
+
     sections: list[str] = []
     prior_summaries: list[str] = []
-    for index, section_name in enumerate(section_names, 1):
+
+    def write_section(index: int, section_name: str, target: str, total: int) -> str:
         prior = "\n".join(prior_summaries[-3:]) or "This is the opening section."
-        section_target = "150-220 spoken English words" if test_mode else "700-900 spoken English words"
-        duration_target = "about 2 minutes for a test run" if test_mode else "about 40-50 minutes at a natural 130-145 words per minute (roughly 5,500-6,700 words total)"
         prompt = f"""
-Write section {index} of {len(section_names)} for a long-form motivational audiobook narration titled/topic:
+Write section {index} of a long-form motivational audiobook narration titled/topic:
 "{topic}"
 
 SECTION THEME: {section_name}
-TARGET: {section_target} for this section. The total finished narration should target {duration_target}.
-Write original, thoughtful, emotionally intense, authoritative prose suitable for spoken narration.
-Use natural paragraphs and varied sentence lengths. Include practical examples and concrete actions.
-Do not mention AI, prompts, sections, word counts, or that this is a generated script.
+TARGET LENGTH: {target}.
+The complete narration should target {duration_target}.
+Write original, thoughtful, emotionally engaging prose suitable for spoken narration.
+Use natural paragraphs, varied sentence lengths, concrete examples, and actionable advice.
+Do not mention AI, prompts, sections, word counts, or that this is generated.
 Do not add headings, bullet points, markdown, stage directions, sound effects, or citations.
 Avoid repetitive slogans and avoid copying passages from copyrighted books.
-Continue coherently from this context of the previous sections:
+Continue coherently from this context of earlier material:
 {prior}
-This section must develop its theme and not repeat earlier material. End with a natural transition
-toward the next idea. Return only narration text.
+Develop this theme without repeating earlier ideas. Return only narration text.
 """
-        section = gemini_text(client, prompt)
-        sections.append(section)
-        # Short context helps continuity without repeatedly sending the entire script.
-        prior_summaries.append(f"Section {index} ({section_name}) summary: " + " ".join(section.split()[:90]))
-        log(f"Generated section {index}/{len(section_names)} ({len(section.split())} words)")
+        result = gemini_text(client, prompt)
+        prior_summaries.append(
+            f"Section {index} ({section_name}) summary: " + " ".join(result.split()[:90])
+        )
+        log(f"Generated section {index}/{total} ({len(result.split())} words)")
+        return result
+
+    for index, section_name in enumerate(section_names, 1):
+        sections.append(write_section(index, section_name, section_target, len(section_names)))
+
+    if test_mode:
+        # If the model ignores the requested size, keep test output short and predictable.
+        script = "\n\n".join(sections)
+        words = script.split()
+        if len(words) > max_words:
+            script = " ".join(words[:max_words])
+        elif len(words) < min_words:
+            # A short supplemental section is preferable to uploading a tiny test.
+            extra = write_section(3, "A concise practical example", "160-190 spoken English words", 3)
+            script = script + "\n\n" + extra
+            words = script.split()
+            if len(words) > max_words:
+                script = " ".join(words[:max_words])
+        final_words = len(script.split())
+        if not min_words <= final_words <= max_words:
+            raise RuntimeError(f"Test narration is {final_words} words; expected {min_words}-{max_words}.")
+        log(f"Test script length: {final_words} words (target duration 2-3 minutes).")
+        return script
+
+    # Top up if the model returned substantially less than requested. Keep the
+    # maximum bounded so a production run cannot accidentally become excessive.
     script = "\n\n".join(sections)
     words = len(script.split())
-    if words < 4500:
-        log(f"Warning: script has only {words} words; narration may be shorter than 40 minutes.")
-    if words > int(os.getenv("MAX_SCRIPT_WORDS", "7000")):
-        log(f"Warning: script has {words} words; trimming to configured maximum.")
-        script = " ".join(script.split()[:int(os.getenv("MAX_SCRIPT_WORDS", "7000"))])
+    extra_index = len(sections) + 1
+    while words < min_words and extra_index <= 12:
+        missing = min_words - words
+        target = f"{max(700, min(850, missing + 100))} spoken English words"
+        extra = write_section(
+            extra_index,
+            f"A further practical lesson ({extra_index})",
+            target,
+            extra_index,
+        )
+        sections.append(extra)
+        script = "\n\n".join(sections)
+        words = len(script.split())
+        extra_index += 1
+
+    if words > max_words:
+        log(f"Trimming generated script from {words} to {max_words} words.")
+        script = " ".join(script.split()[:max_words])
+        words = len(script.split())
+    if words < min_words:
+        raise RuntimeError(
+            f"Gemini produced only {words} words after fallback sections; need at least {min_words}."
+        )
+    log(f"Production script length: {words} words (target duration 40-50 minutes).")
     return script
 
 
@@ -239,7 +303,7 @@ def split_text(text: str, max_chars: int = 2200) -> list[str]:
 
 
 async def synthesize_chunk(text: str, destination: Path) -> list[dict[str, Any]]:
-    communicate = edge_tts.Communicate(text, VOICE, rate="+0%", pitch="+0Hz")
+    communicate = edge_tts.Communicate(text, VOICE, rate=CURRENT_TTS_RATE, pitch="+0Hz")
     boundaries: list[dict[str, Any]] = []
     with destination.open("wb") as audio_file:
         async for event in communicate.stream():
@@ -357,8 +421,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     actual_duration = probe_duration(voice_path)
     minutes = actual_duration / 60
     log(f"Voice duration: {minutes:.1f} minutes ({len(script.split())} script words)")
-    if minutes < MINUTES_MIN or minutes > MINUTES_MAX:
-        log(f"WARNING: narration is outside target {MINUTES_MIN}-{MINUTES_MAX} minutes.")
+    test_mode = os.getenv("FACTORY_TEST_MODE", "false").lower() == "true"
+    lower, upper = (TEST_MINUTES_MIN, TEST_MINUTES_MAX) if test_mode else (PRODUCTION_MINUTES_MIN, PRODUCTION_MINUTES_MAX)
+    if minutes < lower or minutes > upper:
+        log(f"WARNING: narration is outside target {lower}-{upper} minutes.")
     return voice_path, srt_path, ass_path, actual_duration
 
 
@@ -567,6 +633,7 @@ def upload_youtube(video_path: Path, topic: str) -> str:
 
 
 def main() -> int:
+    global CURRENT_TTS_RATE
     for folder in [CLIPS_DIR, MUSIC_DIR, COVERS_DIR, OUTPUT_DIR, WORK_DIR]:
         folder.mkdir(parents=True, exist_ok=True)
     topic, cover_name, queue_lines = read_queue()
@@ -586,6 +653,31 @@ def main() -> int:
     script_path = WORK_DIR / "narration.txt"
     script_path.write_text(script, encoding="utf-8")
     voice, srt, ass, duration = synthesize_script(script, WORK_DIR)
+    duration_minutes = duration / 60.0
+    test_mode = os.getenv("FACTORY_TEST_MODE", "false").lower() == "true"
+    lower, upper = (TEST_MINUTES_MIN, TEST_MINUTES_MAX) if test_mode else (PRODUCTION_MINUTES_MIN, PRODUCTION_MINUTES_MAX)
+
+    # Edge Neural voices can speak at different rates. If the first synthesis is
+    # outside the required duration, adjust the speech rate once and synthesize
+    # again, aiming for the middle of the accepted range.
+    if not lower <= duration_minutes <= upper:
+        target_seconds = (150.0 if test_mode else TARGET_MINUTES * 60.0)
+        try:
+            current_rate_pct = int(CURRENT_TTS_RATE.replace("%", "").replace("+", ""))
+        except ValueError:
+            current_rate_pct = 0
+        adjusted_pct = round((1.0 + current_rate_pct / 100.0) * (duration / target_seconds) - 1.0, 2) * 100
+        adjusted_pct = max(-25, min(25, int(round(adjusted_pct))))
+        CURRENT_TTS_RATE = f"{adjusted_pct:+d}%"
+        log(f"Duration {duration_minutes:.2f} min is outside {lower}-{upper}; retrying TTS at rate {CURRENT_TTS_RATE}.")
+        voice, srt, ass, duration = synthesize_script(script, WORK_DIR)
+        duration_minutes = duration / 60.0
+
+    if not lower <= duration_minutes <= upper:
+        raise RuntimeError(
+            f"Narration duration is {duration_minutes:.2f} minutes after automatic rate adjustment; "
+            f"expected {lower}-{upper} minutes. The video was not rendered or uploaded."
+        )
     video = assemble_video(topic, cover, voice, ass, duration, WORK_DIR)
     video_id = upload_youtube(video, topic)
 
