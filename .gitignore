@@ -1,0 +1,13 @@
+output/*
+!output/README.md
+!output/.gitkeep
+work/*
+!work/README.md
+!work/.gitkeep
+.env
+*.mp4
+*.mp3
+*.wav
+*.srt
+*.ass
+__pycache__/
