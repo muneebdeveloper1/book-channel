@@ -136,32 +136,50 @@ def advance_queue(lines: list[str]) -> None:
 
 
 def gemini_text(client: genai.Client, prompt: str) -> str:
-    errors: list[str] = []
-    for model in MODEL_ORDER:
-        try:
-            log(f"Trying Gemini model: {model}")
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.85,
-                    max_output_tokens=8192,
-                ),
-            )
-            text = (response.text or "").strip()
-            if len(text.split()) < 150:
-                raise RuntimeError("Model returned too little usable text.")
-            return text
-        except Exception as exc:
-            message = f"{model}: {type(exc).__name__}: {exc}"
-            errors.append(message)
-            log("Generation failed; trying next model. " + message[:400])
-    raise RuntimeError("All configured Gemini models failed:\n" + "\n".join(errors))
+    # Retry each model twice per pass. If every model fails, start another pass
+    # and keep going until one returns usable text. Each API request is bounded
+    # by GEMINI_REQUEST_TIMEOUT_SECONDS (90 seconds by default).
+    if not MODEL_ORDER:
+        raise RuntimeError("No Gemini models configured. Set GEMINI_MODELS or restore DEFAULT_MODELS.")
+
+    pass_number = 0
+    while True:
+        pass_number += 1
+        log(f"Starting Gemini fallback pass #{pass_number}; {len(MODEL_ORDER)} models, 2 attempts each")
+        for model in MODEL_ORDER:
+            for attempt in (1, 2):
+                try:
+                    log(f"Trying Gemini model: {model} (attempt {attempt}/2, pass #{pass_number})")
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.85,
+                            max_output_tokens=8192,
+                        ),
+                    )
+                    generated_text = (response.text or "").strip()
+                    if len(generated_text.split()) < 150:
+                        raise RuntimeError("Model returned too little usable text.")
+                    log(f"Gemini model succeeded: {model} (pass #{pass_number}, attempt {attempt}/2)")
+                    return generated_text
+                except Exception as exc:
+                    message = f"{model} attempt {attempt}/2: {type(exc).__name__}: {exc}"
+                    log("Generation failed; continuing fallback. " + message[:400])
+        log(f"All Gemini models failed both attempts in pass #{pass_number}; restarting fallback in 5 seconds")
+        time.sleep(5)
 
 
 def generate_script(topic: str) -> str:
     api_key = require_env("GEMINI_API_KEY")
-    client = genai.Client(api_key=api_key)
+    # Bound each Gemini API call so a stalled model cannot block fallback forever.
+    # The Google Gen AI SDK's HttpOptions.timeout is expressed in milliseconds.
+    timeout_seconds = max(15, int(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "90")))
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=timeout_seconds * 1000),
+    )
+    log(f"Gemini request timeout: {timeout_seconds}s per model attempt")
     test_mode = os.getenv("FACTORY_TEST_MODE", "false").lower() == "true"
 
     if test_mode:
