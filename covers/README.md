@@ -1,0 +1,1 @@
+This sample ZIP includes six original demo covers: cover_01.jpg through cover_06.jpg. They are generated placeholder designs for testing the layout, not real published book covers. Replace them with your own cover art and add more files as needed (30+ recommended for the full queue).
