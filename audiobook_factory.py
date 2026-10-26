@@ -104,35 +104,39 @@ def list_assets(folder: Path, extensions: set[str]) -> list[Path]:
     return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in extensions)
 
 
-def read_queue() -> tuple[str, str, list[str]]:
+def read_queue() -> tuple[str, str, list[str], str]:
     if not QUEUE_FILE.exists():
         raise FileNotFoundError(f"Missing {QUEUE_FILE}")
     lines = [line.strip() for line in QUEUE_FILE.read_text(encoding="utf-8").splitlines()
              if line.strip() and not line.lstrip().startswith("#")]
     if not lines:
         raise RuntimeError("queue.txt has no topics. Add lines in: Topic Title|cover_01.jpg")
-    first = lines[0]
-    if "|" not in first:
-        raise ValueError(f"Invalid queue line: {first!r}. Expected Topic Title|cover_filename.jpg")
-    topic, cover_name = (part.strip() for part in first.split("|", 1))
+    # Pick a random queued topic instead of always taking the first line.
+    selected_line = random.choice(lines)
+    if "|" not in selected_line:
+        raise ValueError(f"Invalid queue line: {selected_line!r}. Expected Topic Title|cover_filename.jpg")
+    topic, cover_name = (part.strip() for part in selected_line.split("|", 1))
     if not topic or not cover_name:
-        raise ValueError(f"Invalid queue line: {first!r}")
+        raise ValueError(f"Invalid queue line: {selected_line!r}")
     cover = (COVERS_DIR / cover_name).resolve()
     if cover.parent != COVERS_DIR.resolve() or not cover.is_file() or cover.suffix.lower() not in IMAGE_EXTS:
         raise FileNotFoundError(f"Cover '{cover_name}' not found in covers/. Add the matching image before running.")
-    return topic, cover_name, lines
+    return topic, cover_name, lines, selected_line
 
 
-def advance_queue(lines: list[str]) -> None:
-    # Called only after the YouTube upload succeeds.
-    active = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
-    remaining = active[1:]
-    comments = [line for line in QUEUE_FILE.read_text(encoding="utf-8").splitlines()
-                if line.lstrip().startswith("#")]
-    QUEUE_FILE.write_text(
-        "\n".join(comments + remaining) + ("\n" if comments or remaining else ""),
-        encoding="utf-8",
-    )
+def advance_queue(selected_line: str) -> None:
+    # Called only after a successful upload; remove the specific randomly selected topic.
+    original = QUEUE_FILE.read_text(encoding="utf-8").splitlines()
+    removed = False
+    remaining = []
+    for line in original:
+        if not removed and line.strip() == selected_line.strip():
+            removed = True
+            continue
+        remaining.append(line)
+    if not removed:
+        log("WARNING: selected topic was not found in queue.txt during advancement.")
+    QUEUE_FILE.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
 
 
 def gemini_text(client: genai.Client, prompt: str) -> str:
@@ -413,7 +417,7 @@ def synthesize_script(script: str, work_dir: Path) -> tuple[Path, Path, Path, fl
     )
     voice_path = work_dir / "voice.mp3"
     run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat",
-         "-safe", "0", "-i", str(concat_file), "-c", "copy", str(voice_path)])
+         "-safe", "0", "-i", str(concat_file), "-c:a", "libmp3lame", "-q:a", "2", str(voice_path)])
 
     srt_path = work_dir / "captions.srt"
     ass_path = work_dir / "captions.ass"
@@ -446,8 +450,8 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,Arial,72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,1,4,1,5,0,0,0,1
-Style: Active,Arial,72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H0000A5FF,-1,0,3,1,0,5,0,0,0,1
+Style: Caption,Arial,90,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,1,6,1,5,0,0,0,1
+Style: Active,Arial,90,&H00FFFFFF,&H00FFFFFF,&H00000000,&H0000BFFF,-1,0,3,6,0,5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -459,8 +463,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             group_end = max(group[-1]["end"], group_start + 0.45)
             # Keep each 3-4 word phrase on one centered line in the right half.
             # Arial's average bold glyph width is approximated for stable word spacing.
-            widths = [max(28, len(w["text"]) * 39) for w in group]
-            gap = 22
+            widths = [max(36, len(w["text"]) * 49) for w in group]
+            # Compact spacing: about 1.25x a normal word gap, avoiding overly spread-out captions.
+            gap = 10
             total_width = sum(widths) + gap * (len(group) - 1)
             x = 1370 - total_width / 2
             positions = []
@@ -702,9 +707,9 @@ def main() -> int:
     global CURRENT_TTS_RATE
     for folder in [CLIPS_DIR, MUSIC_DIR, COVERS_DIR, OUTPUT_DIR, WORK_DIR]:
         folder.mkdir(parents=True, exist_ok=True)
-    topic, cover_name, queue_lines = read_queue()
+    topic, cover_name, queue_lines, selected_queue_line = read_queue()
     cover = COVERS_DIR / cover_name
-    log(f"Starting topic: {topic}")
+    log(f"Randomly selected queue topic: {topic}")
     log(f"Using cover: {cover_name}")
 
     # Remove stale intermediates so a failed run cannot accidentally upload an old result.
@@ -756,7 +761,7 @@ def main() -> int:
     if os.getenv("FACTORY_TEST_MODE", "false").lower() == "true":
         log("Test mode: upload is unlisted and queue was not advanced.")
     else:
-        advance_queue(queue_lines)
+        advance_queue(selected_queue_line)
         log("Queue advanced after successful YouTube upload.")
     return 0
 
