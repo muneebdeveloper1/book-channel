@@ -1,3 +1,2 @@
 # One item per line: Topic Title|cover_filename.jpg
 Think Like a Pro|cover_02.jpg
-Make Your Time Count|cover_06.jpg
